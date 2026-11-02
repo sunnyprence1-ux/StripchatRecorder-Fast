@@ -565,6 +565,7 @@ impl RecorderManager {
         let mut mp4_header: Option<Vec<u8>> = None;
         let mut cached_init_url: Option<String> = None;
         let mut recorded_secs = 0.0;
+        let mut last_sequence: Option<u32> = None;
         let mut retry_count = 0;
         let mut playlist_refresh_failures = 0;
         let mut consecutive_cdn_failures: usize = 0;
@@ -639,6 +640,7 @@ impl RecorderManager {
                     &mut mp4_header,
                     &mut cached_init_url,
                     &mut recorded_secs,
+                    &mut last_sequence,
                     &emitter,
                 ) => {
                     match result {
@@ -787,6 +789,7 @@ impl RecorderManager {
         mp4_header: &mut Option<Vec<u8>>,
         cached_init_url: &mut Option<String>,
         recorded_secs: &mut f64,
+        last_sequence: &mut Option<u32>,
         emitter: &Arc<dyn Emitter>,
     ) -> Result<(usize, usize)> {
         let playlist = api.fetch_playlist(playlist_url).await?;
@@ -831,6 +834,7 @@ impl RecorderManager {
                         if recording_limit_reached(*recorded_secs, limit) {
                             self.rotate_file(username, session_dir, emitter).await?;
                             *recorded_secs = 0.0;
+                            *last_sequence = None;
                         }
                         let ts_path = session_dir
                             .join(format!("{}_segment{:06}.ts", username, segment.sequence));
@@ -847,7 +851,12 @@ impl RecorderManager {
 
                         match convert_to_ts(fmp4, &ts_path).await {
                             Ok(_) => {
-                                append_to_m3u8(session_dir, &ts_path);
+                                let discontinuity = match *last_sequence {
+                                    Some(prev) => segment.sequence > prev.saturating_add(1),
+                                    None => false,
+                                };
+                                append_to_m3u8(session_dir, &ts_path, segment.duration_secs, discontinuity);
+                                *last_sequence = Some(segment.sequence);
                                 downloaded_sequences.insert(segment.sequence);
                                 written += 1;
                                 *recorded_secs += segment.duration_secs;
@@ -910,7 +919,7 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
         {
             tokio::process::Command::new("ffmpeg")
                 .creation_flags(0x08000000)
-                .args(["-y", "-i", "pipe:0", "-c", "copy", "-f", "mpegts"])
+                .args(["-y", "-i", "pipe:0", "-c", "copy", "-muxdelay", "0", "-f", "mpegts"])
                 .arg(ts_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -921,7 +930,7 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
         #[cfg(not(windows))]
         {
             tokio::process::Command::new("ffmpeg")
-                .args(["-y", "-i", "pipe:0", "-c", "copy", "-f", "mpegts"])
+                .args(["-y", "-i", "pipe:0", "-c", "copy", "-muxdelay", "0", "-f", "mpegts"])
                 .arg(ts_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -953,9 +962,16 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
 /// 将 TS 分片文件名追加到会话目录的 playlist.m3u8（标准 HLS 格式）。
 /// Append a TS segment filename to the session directory's playlist.m3u8 (standard HLS format).
 ///
-/// 首次写入时自动添加 M3U8 文件头（`#EXTM3U` 和 `#EXT-X-VERSION:3`）。
-/// Automatically writes the M3U8 header (`#EXTM3U` and `#EXT-X-VERSION:3`) on first write.
-fn append_to_m3u8(session_dir: &std::path::Path, ts_path: &std::path::Path) {
+/// 首次写入时自动添加 M3U8 文件头（`#EXTM3U`、`#EXT-X-VERSION:3`、`#EXT-X-TARGETDURATION:10`）。
+/// 包含真实分片时长；若存在丢片或序号不连续则写入 `#EXT-X-DISCONTINUITY`。
+/// Automatically writes the M3U8 header on first write.
+/// Writes real segment duration and `#EXT-X-DISCONTINUITY` if segments were dropped.
+fn append_to_m3u8(
+    session_dir: &std::path::Path,
+    ts_path: &std::path::Path,
+    duration_secs: f64,
+    discontinuity: bool,
+) {
     let m3u8_path = session_dir.join("playlist.m3u8");
     let Some(filename) = ts_path.file_name().and_then(|n| n.to_str()) else {
         return;
@@ -976,14 +992,23 @@ fn append_to_m3u8(session_dir: &std::path::Path, ts_path: &std::path::Path) {
     };
 
     if needs_header
-        && let Err(e) = file.write_all(b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n")
+        && let Err(e) = file.write_all(b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n")
     {
         tracing::error!("Failed to write M3U8 header: {}", e);
         return;
     }
 
-    // 写入分片条目（时长占位为 0，实际时长未知）/ Write segment entry (duration placeholder 0, actual duration unknown)
-    let line = format!("#EXTINF:0,\n{}\n", filename);
+    if discontinuity && !needs_header {
+        let _ = file.write_all(b"#EXT-X-DISCONTINUITY\n");
+    }
+
+    // 写入真实分片时长（默认兜底 2.0 秒）/ Write real duration (fallback 2.0s)
+    let dur = if duration_secs > 0.0 && duration_secs.is_finite() {
+        duration_secs
+    } else {
+        2.0
+    };
+    let line = format!("#EXTINF:{:.3},\n{}\n", dur, filename);
     if let Err(e) = file.write_all(line.as_bytes()) {
         tracing::error!("Failed to update playlist.m3u8: {}", e);
     }
@@ -1074,15 +1099,48 @@ fn merge_segments(
         .block_on(FFMPEG_SEMAPHORE.acquire())
         .expect("ffmpeg semaphore closed");
 
-    let mut child = match Command::new("ffmpeg")
-        .args(["-y", "-allowed_extensions", "ALL", "-i"])
-        .arg(&m3u8_path)
-        .args(["-c", "copy"])
+    // 生成 concat 列表文件：优先使用 FFmpeg concat demuxer 合并分片，避免 HLS demuxer 在时间戳不连续时的丢帧与 packet corrupt 错误
+    // Generate concat list file: concat demuxer avoids packet corruption and timestamp drops from HLS demuxer
+    let concat_path = session_dir.join("concat_list.txt");
+    let mut use_concat = false;
+    if let Ok(content) = fs::read_to_string(&m3u8_path) {
+        let mut concat_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                let seg_file = session_dir.join(trimmed);
+                if seg_file.exists() {
+                    let escaped = trimmed.replace('\'', "'\\''");
+                    concat_lines.push(format!("file '{}'", escaped));
+                }
+            }
+        }
+        if !concat_lines.is_empty() {
+            if let Ok(mut f) = fs::File::create(&concat_path) {
+                let text = concat_lines.join("\n");
+                if f.write_all(text.as_bytes()).is_ok() {
+                    use_concat = true;
+                }
+            }
+        }
+    }
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y");
+    if use_concat {
+        cmd.current_dir(session_dir)
+            .args(["-f", "concat", "-safe", "0", "-i"])
+            .arg(&concat_path);
+    } else {
+        cmd.args(["-allowed_extensions", "ALL", "-i"])
+            .arg(&m3u8_path);
+    }
+    cmd.args(["-c", "copy"])
         .arg(&output_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to spawn ffmpeg → merge: {}", e);

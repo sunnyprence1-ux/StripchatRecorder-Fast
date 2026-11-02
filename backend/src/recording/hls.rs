@@ -48,8 +48,18 @@ pub fn parse_playlist(
     let mut mp4_header_url = None;
     let mut current_pkey: Option<&str> = None;
     let mut duration_secs = 0.0;
+    let mut media_sequence: Option<u64> = None;
 
     let lines: Vec<&str> = playlist.lines().collect();
+
+    for line in &lines {
+        if let Some(val) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            if let Ok(seq) = val.trim().parse::<u64>() {
+                media_sequence = Some(seq);
+                break;
+            }
+        }
+    }
 
     for (i, line) in lines.iter().enumerate() {
         if let Some(value) = line.strip_prefix("#EXTINF:") {
@@ -121,7 +131,13 @@ pub fn parse_playlist(
             format!("{}/{}", url_prefix, line)
         };
 
-        let sequence = extract_sequence(&url).unwrap_or(segments.len() as u32);
+        let sequence = extract_sequence(&url).unwrap_or_else(|| {
+            if let Some(ms) = media_sequence {
+                (ms + segments.len() as u64) as u32
+            } else {
+                segments.len() as u32
+            }
+        });
         segments.push(HlsSegment {
             url,
             sequence,
@@ -181,12 +197,79 @@ fn decrypt_segment_url(encoded_url: &str, key: &str) -> Result<String> {
     Ok(encoded_url.replace(encrypted_str, &decrypted_str))
 }
 
-/// 从分片 URL 的文件名中提取序号（最后一个 `_` 后、`.` 前的数字）。
-/// Extract the sequence number from a segment URL's filename (number after the last `_`, before `.`).
+/// 从分片 URL 的文件名中提取序号（去掉查询参数，优先从文件名末尾提取数字）。
+/// Extract the sequence number from a segment URL's filename (stripping query parameters).
 fn extract_sequence(url: &str) -> Option<u32> {
-    let filename = url.split('/').next_back()?;
-    let parts: Vec<&str> = filename.split('_').collect();
-    let last = parts.last()?;
-    let num_str = last.split('.').next()?;
-    num_str.parse().ok()
+    // 去除 URL 查询参数和片段标识符 / Strip query string and fragment
+    let clean_url = url.split(['?', '#']).next().unwrap_or(url);
+    let filename = clean_url.split('/').next_back()?;
+
+    // 优先匹配标准分片正则中的序号 / Match sequence from SEGMENT_REGEX if possible
+    if let Some(caps) = SEGMENT_REGEX.captures(filename) {
+        if let Some(m) = caps.get(2) {
+            let part_str = m.as_str().split('_').next().unwrap_or(m.as_str());
+            if let Ok(seq) = part_str.parse::<u32>() {
+                return Some(seq);
+            }
+        }
+    }
+
+    // 去除扩展名后，从后往前查找包含数字的段 / Search backwards for numeric token
+    let stem = filename.split('.').next().unwrap_or(filename);
+    for part in stem.split('_').rev() {
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Ok(seq) = digits.parse::<u32>() {
+                return Some(seq);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_sequence_standard() {
+        assert_eq!(extract_sequence("https://cdn.example.com/stream_12345.mp4"), Some(12345));
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/model_100.ts"), Some(100));
+    }
+
+    #[test]
+    fn test_extract_sequence_with_query_and_token() {
+        // Query param contains underscores
+        let url = "https://b-hls-12.strpst.com/hls/123456/123456_fmp4_abc_789.mp4?hdnts=exp=1730000000_acl=*~data=123";
+        assert_eq!(extract_sequence(url), Some(789));
+    }
+
+    #[test]
+    fn test_extract_sequence_with_part_suffix() {
+        let url = "https://cdn.example.com/hls/stream_456_part1.mp4";
+        assert_eq!(extract_sequence(url), Some(456));
+    }
+
+    #[test]
+    fn test_parse_playlist_media_sequence_and_extinf() {
+        let m3u8 = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:500
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:2.000,
+seg1.mp4
+#EXTINF:1.850,
+seg2.mp4
+"#;
+        let keys = HashMap::new();
+        let (segments, init) = parse_playlist(m3u8, "https://cdn.example.com", &keys).unwrap();
+        assert_eq!(init, Some("https://cdn.example.com/init.mp4".to_string()));
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].duration_secs, 2.0);
+        assert_eq!(segments[0].sequence, 500);
+        assert_eq!(segments[1].duration_secs, 1.85);
+        assert_eq!(segments[1].sequence, 501);
+    }
 }
