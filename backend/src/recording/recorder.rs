@@ -25,9 +25,13 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Semaphore, mpsc};
 
-/// 全局 ffmpeg 并发信号量，限制同时运行的 ffmpeg 进程数（最多 4 个）。
-/// Global ffmpeg concurrency semaphore, limiting simultaneous ffmpeg processes (max 4).
-static FFMPEG_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+/// ffmpeg 分片转封装并发限制信号量（快速进程，每次耗时约数十毫秒）。
+/// Concurrency limit semaphore for fast fMP4->TS segment conversion (tens of milliseconds each).
+static FFMPEG_CONVERT_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+
+/// ffmpeg 完整视频合并并发限制信号量（I/O密集型长任务，避免阻塞活跃录制转封装）。
+/// Dedicated semaphore for long-running video merges so they never starve active segment conversions.
+static FFMPEG_MERGE_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
 
 /// 单个录制会话的状态 / State of a single recording session
 #[derive(Debug, Clone)]
@@ -562,6 +566,8 @@ impl RecorderManager {
         let mut url_prefix = get_url_prefix(&current_playlist_url);
 
         let mut downloaded_sequences: HashSet<u32> = HashSet::new();
+        let mut downloaded_urls: HashSet<String> = HashSet::new();
+        let mut segment_file_index: u64 = 0;
         let mut mp4_header: Option<Vec<u8>> = None;
         let mut cached_init_url: Option<String> = None;
         let mut recorded_secs = 0.0;
@@ -637,10 +643,12 @@ impl RecorderManager {
                     session_dir,
                     username,
                     &mut downloaded_sequences,
+                    &mut downloaded_urls,
                     &mut mp4_header,
                     &mut cached_init_url,
                     &mut recorded_secs,
                     &mut last_sequence,
+                    &mut segment_file_index,
                     &emitter,
                 ) => {
                     match result {
@@ -786,10 +794,12 @@ impl RecorderManager {
         session_dir: &mut PathBuf,
         username: &str,
         downloaded_sequences: &mut HashSet<u32>,
+        downloaded_urls: &mut HashSet<String>,
         mp4_header: &mut Option<Vec<u8>>,
         cached_init_url: &mut Option<String>,
         recorded_secs: &mut f64,
         last_sequence: &mut Option<u32>,
+        segment_file_index: &mut u64,
         emitter: &Arc<dyn Emitter>,
     ) -> Result<(usize, usize)> {
         let playlist = api.fetch_playlist(playlist_url).await?;
@@ -822,12 +832,35 @@ impl RecorderManager {
         let mut cdn_failures = 0;
 
         for segment in segments {
-            if downloaded_sequences.contains(&segment.sequence) {
+            let clean_url = segment.url.split(['?', '#']).next().unwrap_or(&segment.url);
+
+            // 检测流重连 / 序号回退：若序号大幅回退（上一序号 > 10 且当前序号回退），说明推流端重连或序号从 0 重新计数
+            // Detect stream reconnect / sequence reset: if sequence drops significantly, stream restarted
+            if let Some(prev) = *last_sequence {
+                if segment.sequence < prev && prev > 10 {
+                    tracing::warn!(
+                        "Stream sequence reset detected for {} (prev: {}, new: {}), resetting deduplication caches",
+                        username, prev, segment.sequence
+                    );
+                    downloaded_sequences.clear();
+                    downloaded_urls.clear();
+                    *last_sequence = None;
+                }
+            }
+
+            if downloaded_sequences.contains(&segment.sequence) || downloaded_urls.contains(clean_url) {
                 continue;
             }
             new_segments += 1;
 
-            match api.download_segment(&segment.url).await {
+            // 下载分片（失败时等待 150ms 重试一次以应对网络抖动 / Retry once on failure for network jitter）
+            let mut download_res = api.download_segment(&segment.url).await;
+            if download_res.is_err() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                download_res = api.download_segment(&segment.url).await;
+            }
+
+            match download_res {
                 Ok(data) => {
                     if data.len() > 1000 {
                         let limit = self.state.get_settings().max_recording_duration_secs;
@@ -835,9 +868,12 @@ impl RecorderManager {
                             self.rotate_file(username, session_dir, emitter).await?;
                             *recorded_secs = 0.0;
                             *last_sequence = None;
+                            *segment_file_index = 0;
                         }
+
+                        *segment_file_index += 1;
                         let ts_path = session_dir
-                            .join(format!("{}_segment{:06}.ts", username, segment.sequence));
+                            .join(format!("{}_seg{:06}.ts", username, *segment_file_index));
 
                         let fmp4: Vec<u8> = match mp4_header.as_deref() {
                             Some(h) => {
@@ -852,23 +888,31 @@ impl RecorderManager {
                         match convert_to_ts(fmp4, &ts_path).await {
                             Ok(_) => {
                                 let discontinuity = match *last_sequence {
-                                    Some(prev) => segment.sequence > prev.saturating_add(1),
+                                    Some(prev) => segment.sequence > prev.saturating_add(1) || segment.sequence < prev,
                                     None => false,
                                 };
                                 append_to_m3u8(session_dir, &ts_path, segment.duration_secs, discontinuity);
                                 *last_sequence = Some(segment.sequence);
                                 downloaded_sequences.insert(segment.sequence);
+                                downloaded_urls.insert(clean_url.to_string());
                                 written += 1;
                                 *recorded_secs += segment.duration_secs;
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "ffmpeg convert failed → segment {}: {}",
+                                    "ffmpeg convert failed → segment {} (file index {}): {}",
                                     segment.sequence,
+                                    *segment_file_index,
                                     e
                                 );
                             }
                         }
+                    } else {
+                        tracing::warn!(
+                            "Downloaded segment {} too small ({} bytes), skipping",
+                            segment.sequence,
+                            data.len()
+                        );
                     }
                 }
                 Err(e) => {
@@ -876,8 +920,6 @@ impl RecorderManager {
                     cdn_failures += 1;
                 }
             }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
         if new_segments > 0 && cdn_failures == new_segments {
@@ -909,7 +951,7 @@ pub fn ffmpeg_available() -> bool {
 /// 使用 ffmpeg 将 fMP4 数据转换为 MPEG-TS 格式（通过 stdin 管道传入）。
 /// Convert fMP4 data to MPEG-TS format using ffmpeg (piped via stdin).
 async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
-    let _permit = FFMPEG_SEMAPHORE
+    let _permit = FFMPEG_CONVERT_SEMAPHORE
         .acquire()
         .await
         .map_err(|e| AppError::Other(format!("ffmpeg semaphore: {}", e)))?;
@@ -923,7 +965,7 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
                 .arg(ts_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| AppError::Other(format!("Failed to spawn ffmpeg: {}", e)))?
         }
@@ -934,7 +976,7 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
                 .arg(ts_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| AppError::Other(format!("Failed to spawn ffmpeg: {}", e)))?
         }
@@ -948,13 +990,18 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
             .map_err(|e| AppError::Other(format!("ffmpeg stdin write: {}", e)))?;
     }
 
-    let status = child
-        .wait()
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|e| AppError::Other(format!("ffmpeg wait: {}", e)))?;
 
-    if !status.success() {
-        return Err(AppError::Other(format!("ffmpeg exited with {}", status)));
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(format!(
+            "ffmpeg exited with {}: {}",
+            output.status,
+            err_msg.trim()
+        )));
     }
     Ok(())
 }
@@ -1095,16 +1142,27 @@ fn merge_segments(
         })
         .unwrap_or(0);
 
-    let _permit = tokio::runtime::Handle::current()
-        .block_on(FFMPEG_SEMAPHORE.acquire())
-        .expect("ffmpeg semaphore closed");
+    let _permit = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Some(
+            handle
+                .block_on(FFMPEG_MERGE_SEMAPHORE.acquire())
+                .expect("ffmpeg merge semaphore closed"),
+        ),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .build()
+            .ok()
+            .map(|rt| {
+                rt.block_on(FFMPEG_MERGE_SEMAPHORE.acquire())
+                    .expect("ffmpeg merge semaphore closed")
+            }),
+    };
 
     // 生成 concat 列表文件：优先使用 FFmpeg concat demuxer 合并分片，避免 HLS demuxer 在时间戳不连续时的丢帧与 packet corrupt 错误
     // Generate concat list file: concat demuxer avoids packet corruption and timestamp drops from HLS demuxer
     let concat_path = session_dir.join("concat_list.txt");
     let mut use_concat = false;
+    let mut concat_lines = Vec::new();
     if let Ok(content) = fs::read_to_string(&m3u8_path) {
-        let mut concat_lines = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -1115,12 +1173,36 @@ fn merge_segments(
                 }
             }
         }
-        if !concat_lines.is_empty() {
-            if let Ok(mut f) = fs::File::create(&concat_path) {
-                let text = concat_lines.join("\n");
-                if f.write_all(text.as_bytes()).is_ok() {
-                    use_concat = true;
-                }
+    }
+
+    // 若 M3U8 解析不到有效分片，降级扫描会话目录下所有 .ts 分片按字母/序号顺序合并，确保分片永不丢失
+    // Fallback to scanning all .ts segments if m3u8 is empty or corrupted, ensuring no lost segments
+    if concat_lines.is_empty() {
+        if let Ok(entries) = fs::read_dir(session_dir) {
+            let mut ts_files: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) == Some("ts") {
+                        p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ts_files.sort();
+            for name in ts_files {
+                let escaped = name.replace('\'', "'\\''");
+                concat_lines.push(format!("file '{}'", escaped));
+            }
+        }
+    }
+
+    if !concat_lines.is_empty() {
+        if let Ok(mut f) = fs::File::create(&concat_path) {
+            let text = concat_lines.join("\n");
+            if f.write_all(text.as_bytes()).is_ok() {
+                use_concat = true;
             }
         }
     }
@@ -1135,10 +1217,34 @@ fn merge_segments(
         cmd.args(["-allowed_extensions", "ALL", "-i"])
             .arg(&m3u8_path);
     }
-    cmd.args(["-c", "copy"])
-        .arg(&output_path)
+
+    // 时间戳平滑与容错参数：重新生成 PTS、丢弃损坏包、防止负时间戳导致的帧丢失
+    // Timestamp smoothing & robustness: regenerate PTS, discard corrupt packets, avoid negative TS
+    cmd.args([
+        "-c",
+        "copy",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-avoid_negative_ts",
+        "make_zero",
+    ]);
+
+    // MP4/MOV 格式启用 faststart 标记（将 moov atom 移至文件头部，方便边下边播与即时定位）
+    let is_mp4 = output_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let l = e.to_ascii_lowercase();
+            l == "mp4" || l == "m4v" || l == "mov"
+        })
+        .unwrap_or(false);
+    if is_mp4 {
+        cmd.args(["-movflags", "+faststart"]);
+    }
+
+    cmd.arg(&output_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1147,6 +1253,17 @@ fn merge_segments(
             return None;
         }
     };
+
+    // 独立线程排空 stderr 管道，防止大量警告撑爆 64KB 管道缓冲区导致 ffmpeg 死锁
+    // Drain stderr concurrently in a background thread to prevent pipe buffer deadlock
+    let stderr_reader = child.stderr.take().map(|mut r| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            use std::io::Read;
+            let _ = r.read_to_end(&mut buf);
+            buf
+        })
+    });
 
     let poll_interval = std::time::Duration::from_millis(500);
     loop {
@@ -1173,6 +1290,7 @@ fn merge_segments(
     }
 
     let status = child.wait();
+    let stderr_output = stderr_reader.and_then(|h| h.join().ok()).unwrap_or_default();
     match status {
         Ok(s) if s.success() => {
             tracing::info!("Merge complete: {:?}", output_path);
@@ -1205,7 +1323,8 @@ fn merge_segments(
             duration
         }
         Ok(s) => {
-            tracing::warn!("ffmpeg merge exited with {}", s);
+            let err_msg = String::from_utf8_lossy(&stderr_output);
+            tracing::warn!("ffmpeg merge exited with {}: {}", s, err_msg.trim());
             None
         }
         Err(e) => {
@@ -1535,5 +1654,153 @@ fn collect_unprocessed_videos(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::Settings;
+    use crate::core::emitter::NoopEmitter;
+
+    fn generate_test_ts(path: &std::path::Path, duration_secs: u32) {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={}:size=320x240:rate=30", duration_secs),
+                "-c:v",
+                "libx264",
+                "-f",
+                "mpegts",
+            ])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        assert!(status.is_ok() && status.unwrap().success());
+    }
+
+    #[test]
+    fn test_merge_segments_no_missing_segments() {
+        let temp_dir = std::env::temp_dir().join(format!("rec_test_{}", std::process::id()));
+        let session_dir = temp_dir.join("session_1");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // 3 个 2 秒的分片，总时长应为 6 秒
+        let seg1 = session_dir.join("test_seg000001.ts");
+        let seg2 = session_dir.join("test_seg000002.ts");
+        let seg3 = session_dir.join("test_seg000003.ts");
+        generate_test_ts(&seg1, 2);
+        generate_test_ts(&seg2, 2);
+        generate_test_ts(&seg3, 2);
+
+        append_to_m3u8(&session_dir, &seg1, 2.0, false);
+        append_to_m3u8(&session_dir, &seg2, 2.0, false);
+        append_to_m3u8(&session_dir, &seg3, 2.0, false);
+
+        let output_video = temp_dir.join("final.mp4");
+        let emitter: Arc<dyn Emitter> = Arc::new(NoopEmitter);
+        let settings = Settings::default();
+        let session_dir_str = session_dir.to_string_lossy().to_string();
+
+        let duration = merge_segments(
+            &session_dir,
+            &output_video,
+            "test_user",
+            &emitter,
+            &session_dir_str,
+            &settings,
+        );
+
+        assert_eq!(duration, Some(6));
+        assert!(output_video.exists());
+        let probed = get_video_duration(&output_video);
+        assert_eq!(probed, Some(6));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_merge_segments_with_discontinuity_reconnect() {
+        let temp_dir = std::env::temp_dir().join(format!("rec_test_discont_{}", std::process::id()));
+        let session_dir = temp_dir.join("session_2");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // 模拟推流重连：前两片序号正常，第三片发生序号重置（标记 discontinuity），共 4 片各 2 秒
+        let seg1 = session_dir.join("test_seg000001.ts");
+        let seg2 = session_dir.join("test_seg000002.ts");
+        let seg3 = session_dir.join("test_seg000003.ts");
+        let seg4 = session_dir.join("test_seg000004.ts");
+        generate_test_ts(&seg1, 2);
+        generate_test_ts(&seg2, 2);
+        generate_test_ts(&seg3, 2);
+        generate_test_ts(&seg4, 2);
+
+        append_to_m3u8(&session_dir, &seg1, 2.0, false);
+        append_to_m3u8(&session_dir, &seg2, 2.0, false);
+        append_to_m3u8(&session_dir, &seg3, 2.0, true); // 重连发生不连续
+        append_to_m3u8(&session_dir, &seg4, 2.0, false);
+
+        let output_video = temp_dir.join("final_reconnect.mp4");
+        let emitter: Arc<dyn Emitter> = Arc::new(NoopEmitter);
+        let settings = Settings::default();
+        let session_dir_str = session_dir.to_string_lossy().to_string();
+
+        let duration = merge_segments(
+            &session_dir,
+            &output_video,
+            "test_user",
+            &emitter,
+            &session_dir_str,
+            &settings,
+        );
+
+        assert_eq!(duration, Some(8));
+        assert!(output_video.exists());
+        let probed = get_video_duration(&output_video);
+        assert_eq!(probed, Some(8));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_merge_segments_fallback_when_m3u8_corrupted() {
+        let temp_dir = std::env::temp_dir().join(format!("rec_test_fallback_{}", std::process::id()));
+        let session_dir = temp_dir.join("session_3");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // 损坏的 playlist.m3u8（无分片行），仅存放 .ts 分片
+        fs::write(session_dir.join("playlist.m3u8"), b"#EXTM3U\n#EXT-X-VERSION:3\n").unwrap();
+        let seg1 = session_dir.join("test_seg000001.ts");
+        let seg2 = session_dir.join("test_seg000002.ts");
+        generate_test_ts(&seg1, 2);
+        generate_test_ts(&seg2, 2);
+
+        let output_video = temp_dir.join("final_fallback.mp4");
+        let emitter: Arc<dyn Emitter> = Arc::new(NoopEmitter);
+        let settings = Settings::default();
+        let session_dir_str = session_dir.to_string_lossy().to_string();
+
+        let duration = merge_segments(
+            &session_dir,
+            &output_video,
+            "test_user",
+            &emitter,
+            &session_dir_str,
+            &settings,
+        );
+
+        assert_eq!(duration, Some(4));
+        assert!(output_video.exists());
+        let probed = get_video_duration(&output_video);
+        assert_eq!(probed, Some(4));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

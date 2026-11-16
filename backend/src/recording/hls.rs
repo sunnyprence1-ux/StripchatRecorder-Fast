@@ -49,6 +49,7 @@ pub fn parse_playlist(
     let mut current_pkey: Option<&str> = None;
     let mut duration_secs = 0.0;
     let mut media_sequence: Option<u64> = None;
+    let mut pending_mouflon_uri: Option<String> = None;
 
     let lines: Vec<&str> = playlist.lines().collect();
 
@@ -61,7 +62,12 @@ pub fn parse_playlist(
         }
     }
 
-    for (i, line) in lines.iter().enumerate() {
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
         if let Some(value) = line.strip_prefix("#EXTINF:") {
             duration_secs = value
                 .split(',')
@@ -71,7 +77,9 @@ pub fn parse_playlist(
                 .ok()
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .unwrap_or(0.0);
+            continue;
         }
+
         // 解析 Mouflon 加密标签，获取当前 pkey 对应的解密密钥
         // Parse Mouflon encryption tag to get the decryption key for the current pkey
         if line.contains("#EXT-X-MOUFLON:PSCH") {
@@ -80,6 +88,14 @@ pub fn parse_playlist(
                 let pkey = parts[3];
                 current_pkey = mouflon_keys.get(pkey).map(|s| s.as_str());
             }
+            continue;
+        }
+
+        // 解析 Mouflon URI 标签（无论与 #EXTINF 的先后顺序均能正确缓存）
+        // Parse Mouflon URI tag (cached reliably regardless of order relative to #EXTINF)
+        if let Some(raw_url) = line.strip_prefix("#EXT-X-MOUFLON:URI:") {
+            pending_mouflon_uri = Some(raw_url.trim().to_string());
+            continue;
         }
 
         // 解析 fMP4 初始化段 URL（EXT-X-MAP）
@@ -94,24 +110,17 @@ pub fn parse_playlist(
             } else {
                 format!("{}/{}", url_prefix, header_path)
             });
-        }
-
-        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        // 检查前一行是否为 Mouflon URI 标签（加密分片的实际 URL 在标签中）
-        // Check if the previous line is a Mouflon URI tag (actual URL for encrypted segments is in the tag)
-        let mouflon_uri_line = if i > 0 && lines[i - 1].starts_with("#EXT-X-MOUFLON:URI:") {
-            Some(lines[i - 1])
-        } else {
-            None
-        };
+        if line.starts_with('#') {
+            continue;
+        }
 
-        let url = if let Some(mouflon_line) = mouflon_uri_line {
-            let raw_url = mouflon_line.trim_start_matches("#EXT-X-MOUFLON:URI:");
+        // 到达实际分片行，优先使用 Mouflon URI 标签（若存在），否则使用当前分片行 URL
+        let url = if let Some(raw_url) = pending_mouflon_uri.take() {
             let encoded_url = if raw_url.starts_with("https://") {
-                raw_url.to_string()
+                raw_url
             } else if raw_url.starts_with("//") {
                 format!("https:{}", raw_url)
             } else {
@@ -131,13 +140,16 @@ pub fn parse_playlist(
             format!("{}/{}", url_prefix, line)
         };
 
-        let sequence = extract_sequence(&url).unwrap_or_else(|| {
-            if let Some(ms) = media_sequence {
-                (ms + segments.len() as u64) as u32
-            } else {
-                segments.len() as u32
-            }
-        });
+        // 序号提取：优先遵循 RFC 8216 EXT-X-MEDIA-SEQUENCE 规范（基准序号 + 列表索引）
+        // 保证在多分片、分片带 _part 序号或清晰度标记时序号单调递增且不冲突
+        let sequence = if let Some(ms) = media_sequence {
+            (ms + segments.len() as u64) as u32
+        } else if let Some(seq) = extract_sequence(&url) {
+            seq
+        } else {
+            segments.len() as u32
+        };
+
         segments.push(HlsSegment {
             url,
             sequence,
@@ -214,12 +226,12 @@ fn extract_sequence(url: &str) -> Option<u32> {
         }
     }
 
-    // 去除扩展名后，从后往前查找包含数字的段 / Search backwards for numeric token
+    // 去除扩展名后，从后往前查找纯数字的段（避免将 1080p, 720p 等分辨率误识别为序号）
+    // Search backwards for purely numeric token (avoid mistaking 1080p, 720p etc. for sequence)
     let stem = filename.split('.').next().unwrap_or(filename);
     for part in stem.split('_').rev() {
-        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            if let Ok(seq) = digits.parse::<u32>() {
+        if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(seq) = part.parse::<u32>() {
                 return Some(seq);
             }
         }
@@ -252,6 +264,12 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_sequence_resolution_not_sequence() {
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/model_1080p.mp4"), None);
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/model_720p_456.mp4"), Some(456));
+    }
+
+    #[test]
     fn test_parse_playlist_media_sequence_and_extinf() {
         let m3u8 = r#"#EXTM3U
 #EXT-X-VERSION:7
@@ -271,5 +289,28 @@ seg2.mp4
         assert_eq!(segments[0].sequence, 500);
         assert_eq!(segments[1].duration_secs, 1.85);
         assert_eq!(segments[1].sequence, 501);
+    }
+
+    #[test]
+    fn test_parse_playlist_mouflon_uri_order() {
+        let m3u8 = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MEDIA-SEQUENCE:100
+#EXT-X-MOUFLON:URI:https://cdn.example.com/mouflon_seg1.mp4
+#EXTINF:2.000,
+fallback_seg1.mp4
+#EXTINF:1.500,
+#EXT-X-MOUFLON:URI:https://cdn.example.com/mouflon_seg2.mp4
+fallback_seg2.mp4
+"#;
+        let keys = HashMap::new();
+        let (segments, _) = parse_playlist(m3u8, "https://cdn.example.com", &keys).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].url, "https://cdn.example.com/mouflon_seg1.mp4");
+        assert_eq!(segments[0].sequence, 100);
+        assert_eq!(segments[0].duration_secs, 2.0);
+        assert_eq!(segments[1].url, "https://cdn.example.com/mouflon_seg2.mp4");
+        assert_eq!(segments[1].sequence, 101);
+        assert_eq!(segments[1].duration_secs, 1.5);
     }
 }
