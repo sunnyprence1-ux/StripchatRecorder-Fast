@@ -120,6 +120,7 @@ pub struct StreamInfo {
 
 /// Stripchat API 客户端，封装 API 请求和 CDN 分片下载。
 /// Stripchat API client wrapping API requests and CDN segment downloads.
+#[derive(Clone)]
 pub struct StripchatApi {
     /// API 请求客户端（浏览器 TLS 指纹 + DoH 解析）/ API request client (browser TLS fingerprint + DoH resolution)
     api_client: wreq::Client,
@@ -252,6 +253,26 @@ impl StripchatApi {
         };
 
         let node_id = Self::extract_node_id(url).unwrap_or("unknown").to_string();
+
+        // 优先使用当前节点已验证可用的首选 TLD，避免每次请求都触发多 TLD 竞速导致跨边缘节点不同步与连接浪费
+        // Prioritize cached preferred TLD for this node to avoid multi-TLD churn and out-of-sync edge snapshots
+        let cached_tld = self.preferred_tld_by_node.lock().get(&node_id).cloned();
+        if let Some(cached_tld) = cached_tld {
+            let direct_url = url.replace(src_tld, &cached_tld);
+            if let Ok(resp) = self
+                .cdn_client
+                .get(&direct_url)
+                .header("Referer", REFERER)
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    return Ok(resp);
+                }
+            }
+            // 缓存节点不可用时清理，回退到多 TLD 竞速重新选路
+            self.preferred_tld_by_node.lock().remove(&node_id);
+        }
 
         let client = &self.cdn_client;
         let mut tasks = tokio::task::JoinSet::new();
@@ -752,6 +773,10 @@ where
     /// Download the byte data of a single HLS segment.
     pub async fn download_segment(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self.cdn_get(url).await?;
-        Ok(resp.bytes().await?.to_vec())
+        let bytes = resp.bytes().await?.to_vec();
+        if bytes.is_empty() {
+            return Err(AppError::Other(format!("Downloaded 0 bytes from {}", url)));
+        }
+        Ok(bytes)
     }
 }

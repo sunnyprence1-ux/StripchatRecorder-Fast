@@ -551,7 +551,7 @@ impl RecorderManager {
     ) -> Result<()> {
         // 初始设置快照，用于检测变更 / Initial settings snapshot for change detection
         let mut last_settings = self.state.get_settings();
-        let mut api = StripchatApi::new(
+        let mut api = Arc::new(StripchatApi::new(
             last_settings.api_proxy_url.as_deref(),
             last_settings.cdn_proxy_url.as_deref(),
             last_settings.sc_mirror_url.as_deref(),
@@ -561,7 +561,7 @@ impl RecorderManager {
         .with_resolution_selection(
             last_settings.preferred_resolution,
             &last_settings.resolution_preference,
-        );
+        ));
         let mut current_playlist_url = playlist_url.to_string();
         let mut url_prefix = get_url_prefix(&current_playlist_url);
 
@@ -606,12 +606,12 @@ impl RecorderManager {
                     Arc::clone(&self.preferred_tld_by_node),
                 ) {
                     Ok(new_api) => {
-                        api = new_api
+                        api = Arc::new(new_api
                             .with_mouflon_keys(current_mouflon_keys)
                             .with_resolution_selection(
                                 current_settings.preferred_resolution,
                                 &current_settings.resolution_preference,
-                            );
+                            ));
                         tracing::info!(
                             "Recording {}: api client rebuilt due to settings change",
                             username
@@ -651,6 +651,7 @@ impl RecorderManager {
                     &mut segment_file_index,
                     &emitter,
                 ) => {
+                    let had_written = matches!(&result, Ok((n, _)) if *n > 0);
                     match result {
                         Ok((n, cdn_fail)) => {
                             if cdn_fail > 0 {
@@ -769,7 +770,15 @@ impl RecorderManager {
                         break;
                     }
                     if wait_next_round {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                        // 自适应轮询间隔：若本轮有新分片写入，说明正在产生数据，缩短等待至 500ms 紧随直播边缘；
+                        // 若未发现新分片，则等待 1000ms 避免过度请求
+                        // Adaptive polling: 500ms when actively receiving segments, 1000ms when idle
+                        let sleep_ms = if had_written {
+                            500
+                        } else {
+                            1000
+                        };
+                        tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
                     }
                 }
             }
@@ -787,7 +796,7 @@ impl RecorderManager {
     #[allow(clippy::too_many_arguments)]
     async fn fetch_segments(
         self: &Arc<Self>,
-        api: &StripchatApi,
+        api: &Arc<StripchatApi>,
         playlist_url: &str,
         url_prefix: &str,
         mouflon_keys: &HashMap<String, String>,
@@ -827,17 +836,23 @@ impl RecorderManager {
             }
         }
 
-        let mut written = 0;
-        let mut new_segments = 0;
-        let mut cdn_failures = 0;
-
+        // 1. 过滤出尚未下载的新分片，严格跳过已在历史集合中的分片（避免滑动窗口重叠造成误判定）
+        // Filter out already downloaded segments; existing window overlap must never be treated as reset
+        let mut pending_segments: Vec<crate::recording::hls::HlsSegment> = Vec::new();
         for segment in segments {
             let clean_url = segment.url.split(['?', '#']).next().unwrap_or(&segment.url);
+            let is_duplicate = downloaded_sequences.contains(&segment.sequence)
+                || downloaded_urls.contains(clean_url)
+                || downloaded_urls.contains(&segment.url);
 
-            // 检测流重连 / 序号回退：若序号大幅回退（上一序号 > 10 且当前序号回退），说明推流端重连或序号从 0 重新计数
-            // Detect stream reconnect / sequence reset: if sequence drops significantly, stream restarted
+            if is_duplicate {
+                continue;
+            }
+
+            // 检测流真实重连 / 序号大幅回退：仅对新分片且上一序号较大（>50）且序号重置回 10 以内或落差 > 50 时触发
+            // Detect genuine stream reconnect / restart: only for unseen segments where sequence resets to near 0
             if let Some(prev) = *last_sequence {
-                if segment.sequence < prev && prev > 10 {
+                if prev > 50 && (segment.sequence <= 10 || prev.saturating_sub(segment.sequence) > 50) {
                     tracing::warn!(
                         "Stream sequence reset detected for {} (prev: {}, new: {}), resetting deduplication caches",
                         username, prev, segment.sequence
@@ -848,18 +863,52 @@ impl RecorderManager {
                 }
             }
 
-            if downloaded_sequences.contains(&segment.sequence) || downloaded_urls.contains(clean_url) {
-                continue;
-            }
-            new_segments += 1;
+            pending_segments.push(segment);
+        }
 
-            // 下载分片（失败时等待 150ms 重试一次以应对网络抖动 / Retry once on failure for network jitter）
-            let mut download_res = api.download_segment(&segment.url).await;
-            if download_res.is_err() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                download_res = api.download_segment(&segment.url).await;
-            }
+        if pending_segments.is_empty() {
+            return Ok((0, 0));
+        }
 
+        let new_segments = pending_segments.len();
+        let mut written = 0;
+        let mut cdn_failures = 0;
+
+        // 2. 并发下载所有新分片（带重试与小退避），缩短下载耗时以紧跟直播边缘
+        // Concurrently download new segments (with retries) to stay tightly at the live edge
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, seg) in pending_segments.iter().enumerate() {
+            let api = Arc::clone(api);
+            let url = seg.url.clone();
+            join_set.spawn(async move {
+                let mut res = api.download_segment(&url).await;
+                if res.is_err() || res.as_ref().map(|d| d.len() <= 1000).unwrap_or(false) {
+                    for attempt in 1..=2 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(attempt * 150)).await;
+                        res = api.download_segment(&url).await;
+                        if let Ok(ref d) = res {
+                            if d.len() > 1000 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                (idx, res)
+            });
+        }
+
+        let mut download_results: Vec<Option<Result<Vec<u8>>>> = (0..pending_segments.len()).map(|_| None).collect();
+        while let Some(join_res) = join_set.join_next().await {
+            if let Ok((idx, download_res)) = join_res {
+                download_results[idx] = Some(download_res);
+            }
+        }
+
+        // 3. 按原始播放列表顺序处理转换和写入，保证文件命名和时间戳单调递增
+        // Process conversion and append in original playlist order to maintain monotonic indexing
+        for (segment, download_opt) in pending_segments.into_iter().zip(download_results) {
+            let download_res = download_opt.unwrap_or_else(|| Err(AppError::Other("Download cancelled".to_string())));
+            let clean_url = segment.url.split(['?', '#']).next().unwrap_or(&segment.url).to_string();
             match download_res {
                 Ok(data) => {
                     if data.len() > 1000 {
@@ -894,7 +943,8 @@ impl RecorderManager {
                                 append_to_m3u8(session_dir, &ts_path, segment.duration_secs, discontinuity);
                                 *last_sequence = Some(segment.sequence);
                                 downloaded_sequences.insert(segment.sequence);
-                                downloaded_urls.insert(clean_url.to_string());
+                                downloaded_urls.insert(clean_url);
+                                downloaded_urls.insert(segment.url);
                                 written += 1;
                                 *recorded_secs += segment.duration_secs;
                             }
@@ -909,10 +959,11 @@ impl RecorderManager {
                         }
                     } else {
                         tracing::warn!(
-                            "Downloaded segment {} too small ({} bytes), skipping",
+                            "Downloaded segment {} too small ({} bytes) after retries, skipping",
                             segment.sequence,
                             data.len()
                         );
+                        cdn_failures += 1;
                     }
                 }
                 Err(e) => {
@@ -961,7 +1012,7 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
         {
             tokio::process::Command::new("ffmpeg")
                 .creation_flags(0x08000000)
-                .args(["-y", "-i", "pipe:0", "-c", "copy", "-muxdelay", "0", "-f", "mpegts"])
+                .args(["-y", "-loglevel", "warning", "-i", "pipe:0", "-c", "copy", "-muxdelay", "0", "-f", "mpegts"])
                 .arg(ts_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -972,7 +1023,7 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
         #[cfg(not(windows))]
         {
             tokio::process::Command::new("ffmpeg")
-                .args(["-y", "-i", "pipe:0", "-c", "copy", "-muxdelay", "0", "-f", "mpegts"])
+                .args(["-y", "-loglevel", "warning", "-i", "pipe:0", "-c", "copy", "-muxdelay", "0", "-f", "mpegts"])
                 .arg(ts_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -984,10 +1035,8 @@ async fn convert_to_ts(fmp4_data: Vec<u8>, ts_path: &PathBuf) -> Result<()> {
 
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(&fmp4_data)
-            .await
-            .map_err(|e| AppError::Other(format!("ffmpeg stdin write: {}", e)))?;
+        let _ = stdin.write_all(&fmp4_data).await;
+        let _ = stdin.shutdown().await;
     }
 
     let output = child
@@ -1218,13 +1267,13 @@ fn merge_segments(
             .arg(&m3u8_path);
     }
 
-    // 时间戳平滑与容错参数：重新生成 PTS、丢弃损坏包、防止负时间戳导致的帧丢失
-    // Timestamp smoothing & robustness: regenerate PTS, discard corrupt packets, avoid negative TS
+    // 时间戳平滑与容错参数：重新生成 PTS、防止负时间戳导致的帧丢失（避免 +discardcorrupt 误丢正常帧）
+    // Timestamp smoothing & robustness: regenerate PTS, avoid negative TS (without discardcorrupt)
     cmd.args([
         "-c",
         "copy",
         "-fflags",
-        "+genpts+discardcorrupt",
+        "+genpts",
         "-avoid_negative_ts",
         "make_zero",
     ]);
@@ -1802,5 +1851,93 @@ mod tests {
         assert_eq!(probed, Some(4));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sliding_window_deduplication_no_false_resets() {
+        use crate::recording::hls::HlsSegment;
+        let mut downloaded_sequences: HashSet<u32> = HashSet::new();
+        let mut downloaded_urls: HashSet<String> = HashSet::new();
+        let mut last_sequence: Option<u32> = None;
+
+        let simulate_round = |segments: Vec<HlsSegment>,
+                              downloaded_sequences: &mut HashSet<u32>,
+                              downloaded_urls: &mut HashSet<String>,
+                              last_sequence: &mut Option<u32>|
+         -> Vec<u32> {
+            let mut pending_sequences = Vec::new();
+            for segment in segments {
+                let clean_url = segment.url.split(['?', '#']).next().unwrap_or(&segment.url);
+                let is_duplicate = downloaded_sequences.contains(&segment.sequence)
+                    || downloaded_urls.contains(clean_url)
+                    || downloaded_urls.contains(&segment.url);
+
+                if is_duplicate {
+                    continue;
+                }
+
+                if let Some(prev) = *last_sequence {
+                    if prev > 50 && (segment.sequence <= 10 || prev.saturating_sub(segment.sequence) > 50) {
+                        downloaded_sequences.clear();
+                        downloaded_urls.clear();
+                        *last_sequence = None;
+                    }
+                }
+
+                pending_sequences.push(segment.sequence);
+                *last_sequence = Some(segment.sequence);
+                downloaded_sequences.insert(segment.sequence);
+                downloaded_urls.insert(clean_url.to_string());
+                downloaded_urls.insert(segment.url.clone());
+            }
+            pending_sequences
+        };
+
+        let seg = |seq: u32| HlsSegment {
+            url: format!("https://cdn.example.com/hls/model_{}.mp4", seq),
+            sequence: seq,
+            duration_secs: 2.0,
+        };
+
+        // Round 1: Live window [100, 101, 102]
+        let r1 = simulate_round(
+            vec![seg(100), seg(101), seg(102)],
+            &mut downloaded_sequences,
+            &mut downloaded_urls,
+            &mut last_sequence,
+        );
+        assert_eq!(r1, vec![100, 101, 102]);
+        assert_eq!(last_sequence, Some(102));
+
+        // Round 2: Sliding window advances by 1 [101, 102, 103]
+        // 101 and 102 MUST be skipped as duplicates without triggering false reset!
+        let r2 = simulate_round(
+            vec![seg(101), seg(102), seg(103)],
+            &mut downloaded_sequences,
+            &mut downloaded_urls,
+            &mut last_sequence,
+        );
+        assert_eq!(r2, vec![103]);
+        assert_eq!(last_sequence, Some(103));
+
+        // Round 3: Sliding window advances by 1 [102, 103, 104]
+        let r3 = simulate_round(
+            vec![seg(102), seg(103), seg(104)],
+            &mut downloaded_sequences,
+            &mut downloaded_urls,
+            &mut last_sequence,
+        );
+        assert_eq!(r3, vec![104]);
+        assert_eq!(last_sequence, Some(104));
+
+        // Round 4: Genuine stream restart from sequence 1 [1, 2, 3]
+        let r4 = simulate_round(
+            vec![seg(1), seg(2), seg(3)],
+            &mut downloaded_sequences,
+            &mut downloaded_urls,
+            &mut last_sequence,
+        );
+        assert_eq!(r4, vec![1, 2, 3]);
+        assert_eq!(last_sequence, Some(3));
     }
 }

@@ -140,12 +140,12 @@ pub fn parse_playlist(
             format!("{}/{}", url_prefix, line)
         };
 
-        // 序号提取：优先遵循 RFC 8216 EXT-X-MEDIA-SEQUENCE 规范（基准序号 + 列表索引）
-        // 保证在多分片、分片带 _part 序号或清晰度标记时序号单调递增且不冲突
-        let sequence = if let Some(ms) = media_sequence {
-            (ms + segments.len() as u64) as u32
-        } else if let Some(seq) = extract_sequence(&url) {
+        // 序号提取：优先提取 URL 中的真实分片号（源端生成，不受 CDN 切片或重放影响）
+        // 若分片 URL 未包含序号，则遵循 RFC 8216 EXT-X-MEDIA-SEQUENCE 规范
+        let sequence = if let Some(seq) = extract_sequence(&url) {
             seq
+        } else if let Some(ms) = media_sequence {
+            (ms + segments.len() as u64) as u32
         } else {
             segments.len() as u32
         };
@@ -209,8 +209,8 @@ fn decrypt_segment_url(encoded_url: &str, key: &str) -> Result<String> {
     Ok(encoded_url.replace(encrypted_str, &decrypted_str))
 }
 
-/// 从分片 URL 的文件名中提取序号（去掉查询参数，优先从文件名末尾提取数字）。
-/// Extract the sequence number from a segment URL's filename (stripping query parameters).
+/// 从分片 URL 的文件名或参数中提取序号（避免将前缀模型ID或清晰度标签误认为序号）。
+/// Extract the sequence number from a segment URL's filename or query parameters.
 fn extract_sequence(url: &str) -> Option<u32> {
     // 去除 URL 查询参数和片段标识符 / Strip query string and fragment
     let clean_url = url.split(['?', '#']).next().unwrap_or(url);
@@ -226,13 +226,44 @@ fn extract_sequence(url: &str) -> Option<u32> {
         }
     }
 
-    // 去除扩展名后，从后往前查找纯数字的段（避免将 1080p, 720p 等分辨率误识别为序号）
-    // Search backwards for purely numeric token (avoid mistaking 1080p, 720p etc. for sequence)
+    // 去除扩展名后，从后往前查找纯数字的段（避免将 1080p, 720p 等分辨率误识别为序号，且若有多段则跳过第一段模型ID）
+    // Search backwards for purely numeric token (avoid mistaking resolution or model ID for sequence)
     let stem = filename.split('.').next().unwrap_or(filename);
-    for part in stem.split('_').rev() {
+    let parts: Vec<&str> = stem.split('_').collect();
+    if parts.len() > 1 {
+        // 跳过 parts[0]（通常为模型ID或流名前缀），仅从后缀部分倒序寻找纯数字序号
+        for &part in parts[1..].iter().rev() {
+            if part.starts_with("part") && part[4..].chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(seq) = part.parse::<u32>() {
+                    return Some(seq);
+                }
+            }
+        }
+    } else if let Some(&part) = parts.first() {
         if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(seq) = part.parse::<u32>() {
                 return Some(seq);
+            }
+        }
+    }
+
+    // 若文件名无序号，检查 URL 查询参数中是否包含明确的序号标记（如 ?seq=123 或 ?segment=123）
+    if let Some(query) = url.split(['?', '#']).nth(1) {
+        for param in query.split('&') {
+            if let Some((k, v)) = param.split_once('=') {
+                if (k.eq_ignore_ascii_case("seq")
+                    || k.eq_ignore_ascii_case("segment")
+                    || k.eq_ignore_ascii_case("chunk"))
+                    && !v.is_empty()
+                    && v.chars().all(|c| c.is_ascii_digit())
+                {
+                    if let Ok(seq) = v.parse::<u32>() {
+                        return Some(seq);
+                    }
+                }
             }
         }
     }
@@ -266,7 +297,11 @@ mod tests {
     #[test]
     fn test_extract_sequence_resolution_not_sequence() {
         assert_eq!(extract_sequence("https://cdn.example.com/hls/model_1080p.mp4"), None);
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/12345_1080p.mp4"), None);
         assert_eq!(extract_sequence("https://cdn.example.com/hls/model_720p_456.mp4"), Some(456));
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/12345_720p_456.mp4"), Some(456));
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/stream.mp4?seq=789"), Some(789));
+        assert_eq!(extract_sequence("https://cdn.example.com/hls/chunk.mp4?segment=999"), Some(999));
     }
 
     #[test]
