@@ -198,8 +198,12 @@ Telegram 模块支持三种登录方式，由参数 `account` 选择（默认 `a
 不会再有 `ModelName / Timestamp / Duration / FileName / FileSize` 这段说明。
 需要时在流水线节点或发送对话框里打开即可。
 
-「同时发送封面图」（参数 `send_cover`，默认开启）控制是否发送联系表截图；
+「同时发送封面图」（参数 `send_cover`，默认关闭）控制是否发送联系表截图；
 把它也关掉，群里就只会出现一条纯视频消息。
+
+若想显示个人账号名称，请在群组管理员权限里关闭该账号的「保持匿名」。发送者显示由 Telegram 控制，
+录制器无法覆盖匿名管理员设置。已有流水线节点会保留原参数；请在节点里设为 `account=user`、
+`send_cover=false` 和 `send_caption=false`，即可只发送视频。
 
 ### 先发封面图，再发视频
 

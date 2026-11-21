@@ -175,9 +175,9 @@ pub fn send_defaults(state: &AppState) -> SendDefaults {
         // 与模块保持一致：文字说明默认关闭，只上传视频
         // Match the module: the caption is off by default, so only the video is uploaded
         send_caption: param_bool(&params, "send_caption", false),
-        send_cover: param_bool(&params, "send_cover", true),
-        // 与模块保持一致：默认先把联系表作为图片发出去，再发视频
-        // Match the module: the contact sheet is posted as an image before the video by default
+        send_cover: param_bool(&params, "send_cover", false),
+        // 与模块保持一致：默认只发视频，不单独发送联系表
+        // Match the module: video only by default, with no separate contact sheet
         cover_first: param_bool(&params, "cover_first", true),
         batch_size: params.get("batch_size").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(3),
         account,
@@ -593,7 +593,7 @@ mod tests {
             delete_after_send: param_bool(params, "delete_after_send", true),
             send_video: param_bool(params, "send_video", true),
             send_caption: param_bool(params, "send_caption", false),
-            send_cover: param_bool(params, "send_cover", true),
+            send_cover: param_bool(params, "send_cover", false),
             cover_first: param_bool(params, "cover_first", true),
             account: "auto".to_string(),
             has_account: false,
@@ -646,7 +646,7 @@ mod tests {
         assert!(!param_bool(&HashMap::new(), "send_caption", false));
         let d = send_defaults_from(&HashMap::new());
         assert!(!d.send_caption, "caption must be off by default");
-        assert!(d.send_cover, "the cover image stays on by default");
+        assert!(!d.send_cover, "the cover image is off by default");
         assert!(d.send_video, "the video stays on by default");
     }
 

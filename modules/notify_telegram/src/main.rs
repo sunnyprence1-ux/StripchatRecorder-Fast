@@ -96,7 +96,7 @@ const DESCRIBE: &str = r#"{
     "params": [
         {
         "key": "account",
-        "label": "登录方式（auto = 已登录的真实账号优先 / user = 只用用户账号 / bot = 只用机器人）",
+        "label": "登录方式（auto = 个人账号优先 / user = 只用个人账号 / bot = 只用机器人）",
         "type": "select",
         "default": "auto",
         "options": ["auto", "user", "bot"]
@@ -153,7 +153,7 @@ const DESCRIBE: &str = r#"{
         "key": "send_cover",
         "label": "同时发送封面图（联系表截图）。关闭后相册里只有视频",
         "type": "boolean",
-        "default": true
+        "default": false
         },
         {
         "key": "cover_first",
@@ -777,8 +777,8 @@ enum SessionMode {
 }
 
 impl SessionMode {
-    /// 解析 `account` 参数（默认 `auto`：优先使用已登录的真实账号）。
-    /// Parse the `account` parameter (defaults to `auto`: the signed-in real account wins).
+    /// 解析 `account` 参数（默认 `auto`：优先使用已登录的个人账号）。
+    /// Parse the `account` parameter (defaults to `auto`: prefer a signed-in user account).
     fn from_param(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "user" => SessionMode::User,
@@ -2549,8 +2549,8 @@ fn read_config() -> Result<TgConfig, String> {
     // 文字说明默认关闭：只上传视频，不往群里发任何文字
     // The text caption is off by default: upload the video, post no text at all
     let send_caption = param_bool("send_caption", false);
-    // 封面图默认开启 / The cover image is on by default
-    let send_cover = param_bool("send_cover", true);
+    // 默认只发视频，不再额外发送联系表图片 / Video only by default; no separate contact sheet
+    let send_cover = param_bool("send_cover", false);
     // 默认先把封面图单独发出去，再上传视频 / By default the cover is posted on its own first
     let cover_first = param_bool("cover_first", true);
     // 三项全关 = 没有任何内容可发，提前报错而不是连上 Telegram 后才发现
@@ -3566,7 +3566,7 @@ mod tests {
             .find(|p| p["key"] == "send_cover")
             .expect("send_cover param is declared");
         assert_eq!(cover["type"], "boolean");
-        assert_eq!(cover["default"], true);
+        assert_eq!(cover["default"], false);
     }
 
     /// 封面图默认先单独发一条，再发视频：`cover_first` 必须存在且默认开启。

@@ -190,8 +190,13 @@ A user account can list forum topics, so existing topics are reused reliably and
 carries no text at all — no more `ModelName / Timestamp / Duration / FileName / FileSize` block. Turn it
 on from the pipeline node or the send dialog when you want it.
 
-"Also send the cover image" (`send_cover`, on by default) controls whether the contact-sheet preview is
+"Also send the cover image" (`send_cover`, off by default) controls whether the contact-sheet preview is
 sent. Switch that off too and the group receives a single, bare video message.
+
+To post under the personal account name, turn off **Remain anonymous** for that account in the
+group's admin rights. Telegram chooses the displayed sender identity; the recorder cannot override
+an anonymous-admin setting. Existing pipeline nodes keep their saved values, so set `account=user`,
+`send_cover=false`, and `send_caption=false` on an existing node to get video-only posts.
 
 ### Cover image first, then the video
 
